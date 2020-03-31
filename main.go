@@ -1,202 +1,143 @@
 package main
 
 import (
-	"github.com/spark404/go-coremidi"
 	"fmt"
-	"bytes"
-	"net/http"
-	"time"
-	"encoding/json"
-	"io/ioutil"
+	"github.com/spark404/go-coremidi"
 	"log"
+	strconv2 "strconv"
+	"strings"
+	"time"
 )
 
 type Playback struct {
-	Group string
-	Page int
-	Index int
+	Group   string
+	Page    int
+	Index   int
 	TitanId int
-	Active bool
+	Active  bool
+}
+
+type GrblStatus struct {
+	state    string
+	position struct {
+		X float64
+		Y float64
+		Z float64
+	}
+}
+
+type GrblPositionChangeRequest struct {
+	X        int
+	Y        int
+	Z        int
+	Relative bool
+}
+
+type GrblCommandStack struct {
+	rxbufferRemaining int
+	commands          []string
+}
+
+func (g *GrblCommandStack) Push(command string) (int, error) {
+	g.commands = append(g.commands, command)
+	g.rxbufferRemaining -= len(command)
+
+	log.Printf("Push command '%s' on stack, %d remaining", command, g.rxbufferRemaining)
+	return len(command), nil
+}
+
+func (g *GrblCommandStack) Pop() error {
+	if len(g.commands) == 0 {
+		return fmt.Errorf("no commands to pop")
+	}
+
+	poppedCommand := g.commands[0]
+	g.commands = g.commands[1:]
+
+	g.rxbufferRemaining += len(poppedCommand)
+
+	log.Printf("Pop command '%s' from stack, %d remaining", poppedCommand, g.rxbufferRemaining)
+	return nil
+}
+
+func (g *GrblCommandStack) CanPush(command string) bool {
+	return g.rxbufferRemaining >= len(command)
 }
 
 func main() {
-	client, err := coremidi.NewClient("midithing")
+	serialData := make(chan string)
+	statusUpdate := make(chan GrblStatus, 2)
+	positionChange := make(chan GrblPositionChangeRequest, 2)
 
+	serialConnection, err := NewSerialConnection(serialData)
 	if err != nil {
-		fmt.Println(err)
-		return
+		log.Fatal(err)
 	}
 
-	devices, err := coremidi.AllDevices()
-
-	if (err != nil) {
-		fmt.Println(err)
-		return
+	_, err = NewLaunchpad(statusUpdate, positionChange)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	launchpads := Filter(devices, func (v coremidi.Device) bool {
-		return "Launchpad Pro" == v.Name()
-	})
-
-	if len(launchpads) == 0 {
-		fmt.Println("Device \"Launchpad Pro\" not found")
-		return
+	stack := GrblCommandStack{
+		rxbufferRemaining: 126,
 	}
 
-	launchpad := launchpads[0] // Use the first one regardless
-	fmt.Printf("Found %v : %v\n", launchpad.Manufacturer(), launchpad.Name())
-
-	if launchpad.IsOffline() {
-		fmt.Printf("Device is not online\n");
-
-		return
-	}
-
-	entities, err := launchpad.Entities()
-
-	if (err != nil) {
-		fmt.Println(err)
-		return
-	}
-
-	entities = FindEntityByName(entities, "Standalone Port");
-	if len(entities) == 0 {
-		fmt.Println("Failed to find port")
-	}
-
-	entity := entities[0]
-
-	destinations, err := entity.Destinations()
-
-	if (err != nil) {
-		fmt.Println(err)
-		return
-	}
-
-	destination := destinations[0];
-	
-	fmt.Printf("Connecting to %s using destination %s\n", launchpad.Name(), destination.Name())
-
-	outPort, err := coremidi.NewOutputPort(client, "Midithing Out")
-	
-	if (err != nil) {
-		fmt.Println(err)
-		return
-	}
-	
-	var modeChange bytes.Buffer
-	modeChange.WriteByte(0xF0)
-	modeChange.WriteByte(0x00)
-	modeChange.WriteByte(0x20)
-	modeChange.WriteByte(0x29)
-	modeChange.WriteByte(0x02)
-	modeChange.WriteByte(0x10)
-	modeChange.WriteByte(0x2C)
-	modeChange.WriteByte(0x03) // layout between 0 and 3
-	modeChange.WriteByte(0xF7)
-
-	modeChangePacket := coremidi.NewPacket(modeChange.Bytes())
-	err = modeChangePacket.Send(&outPort, &destination)
-	
-	if (err != nil) {
-		fmt.Println(err)
-		return
-	}
-
-	var setAll bytes.Buffer
-	setAll.WriteByte(0xF0)
-	setAll.WriteByte(0x00)
-	setAll.WriteByte(0x20)
-	setAll.WriteByte(0x29)
-	setAll.WriteByte(0x02)
-	setAll.WriteByte(0x10)
-	setAll.WriteByte(0x0E) // set all
-	setAll.WriteByte(0x00) // color
-	setAll.WriteByte(0xF7)
-
-	setAllPacket := coremidi.NewPacket(setAll.Bytes())
-	err = setAllPacket.Send(&outPort, &destination)
-	
-	if (err != nil) {
-		fmt.Println(err)
-		return
-	}
-
-
-	var netClient = &http.Client{
-  		Timeout: time.Second * 10,
-	}
+	tick := time.Tick(1 * time.Second)
 
 	for {
+		select {
+		case message := <-serialData:
+			log.Printf("IN: %s", message)
+			if message[0] == '<' {
+				status, err := ParseStatus(message)
+				if err != nil {
+					log.Printf("failed to parse status: %v", err)
+					continue
+				}
 
-		req, err := http.NewRequest("GET", "http://kubernetes.strocamp.net:8888/playback/", nil)
-		req.Header.Add("X-Auth-ApiKey", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJDb2xvck15U0hBMjA" +
-			"xNyIsInN1YiI6Imh1Z29AdHJpcHBhZXJzLm5sIiwibmJmIjoxNDk5NjE2ODI3LCJ" +
-			"leHAiOjE1MzExNTI4MjcsImlhdCI6MTQ5OTYxNjgyNywianRpIjoiaWQ0MiIsInR" +
-			"5cCI6Imh0dHBzOi8va3ViZXJuZXRlcy5zdHJvY2FtcC5uZXQifQ.vAFytnvw-T-7" +
-			"E2OKsbclpki2ZmCwAm_uJq3Q2AgVzj9HBd7_Lw_S1Wtid_MoKMwBWNCEN0vne-oq" +
-			"HZgJ0krN5rQHNEoOO7BAjaiPKEzyBQ6l6iWvuavimrpWML0g1Cj2npwZbbcclAHN" +
-			"nCtwDQLKWQnQgGlR1qtEB3M4pzTkqJEerqC4ZrQXdKx3qchyDoRN4D6lbsuX1N5j" +
-			"gAuqiULcVwF_0y8No_HkpURWWzPY0wPVN7iOi6PAJwIerA-adue6N-zqlIyxNkNo" +
-			"A5ybjaAw01BU5cMPv3Yi_0EqeyDY8Etk4y8kMjKsBdRLPom2smiDpNwYinIoy5qN" +
-			"hiuArq1szdKPwK9IfQ9ByxcMC3mgOadv0nLkViAEEsBRQLDpoyKo6uCaEiaG2Lwh" +
-			"y8VXY2K1XOMlmWKPGwv4DMKR6hmum8e9gCyX_xiWzR1CHMy-Ey632-7-A_2MDxKn" +
-			"UF5KzygmN35L1N6OsYUHARlM0Mcw4gD1v85lJz7AvanMxDx5YAUYhSDsB1KJTaQ-" +
-			"WT5RTmhOLdrBdIDE9SHmZPoUFCTgsmX4NLSeab8yYLm3j4OMj2coA49-C8RgPprp" +
-			"69ClNsKnNHKfXSKqMMemGRwAg4_JlGlgHOXQP8CzdTk-HDc8kn-C-xdWfakPsWvG" +
-			"DyT_rtrNxFCs4ZNrT6zRvIg38WyGZNs")
-		req.Header.Add("Accept", "application/json")
-
-		resp, err := netClient.Do(req)
-		if (err != nil) {
-			fmt.Println(err)
-			return
-		}
-
-		if resp.Status != "200 " {
-			log.Fatal("Response code " + resp.Status + " received")
-		}
-		rawJson, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		var playbacks []Playback
-		err = json.Unmarshal(rawJson, &playbacks)
-		if err != nil {
-			fmt.Println("error:", err)
-		}
-		
-		for _, element := range playbacks {
-			var ledOn bytes.Buffer
-			ledOn.WriteByte(0x90)
-			ledOn.WriteByte(mapIndexToLaunchpadButton(element.Index))
-			color := 0x2D
-			if element.TitanId != 0 {
-				color = 72
+				statusUpdate <- *status
+			} else if message[0] == 'o' && message[1] == 'k' {
+				stack.Pop()
 			}
-			ledOn.WriteByte(byte(color))
-
-			ledOnPacket := coremidi.NewPacket(ledOn.Bytes())
-			err = ledOnPacket.Send(&outPort, &destination)
-			if (err != nil) {
-				fmt.Println(err)
+		case delta := <-positionChange:
+			var command string
+			if delta.Relative {
+				command = fmt.Sprintf("G91 X%.3f Y%.3f\r", float64(delta.X*100), float64(delta.Y*100))
+			} else {
+				command = fmt.Sprintf("G90 X%.3f Y%.3f\r", float64(delta.X*100), float64(delta.Y*100))
 			}
-		}
+			if stack.CanPush(command) {
+				if _, err := serialConnection.Write(command); err != nil {
+					log.Printf("Failed to send command to serial connection: %v", err)
+					continue
+				}
+				stack.Push(command)
+			}
+		case <-tick:
+			n, err := serialConnection.Write("?")
+			if err != nil {
+				log.Printf("write error: %v", err)
+			}
 
-		time.Sleep(10 * time.Second)
+			if n != 1 {
+				log.Println("huh")
+			}
+		default:
+			// Pacing, do we need this?
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
 func Filter(vs []coremidi.Device, f func(coremidi.Device) bool) []coremidi.Device {
-    vsf := make([]coremidi.Device, 0)
-    for _, v := range vs {
-        if f(v) {
-            vsf = append(vsf, v)
-        }
-    }
-    return vsf
+	vsf := make([]coremidi.Device, 0)
+	for _, v := range vs {
+		if f(v) {
+			vsf = append(vsf, v)
+		}
+	}
+	return vsf
 }
 
 func FindEntityByName(entities []coremidi.Entity, needle string) []coremidi.Entity {
@@ -210,10 +151,33 @@ func FindEntityByName(entities []coremidi.Entity, needle string) []coremidi.Enti
 	return vsf
 }
 
-func mapIndexToLaunchpadButton(index int) byte {
-	if (index < 0 || index > 63) {
-		log.Fatal("Index " + string(index) + " doesn't fit on the display")
+func ParseStatus(rawMessage string) (*GrblStatus, error) {
+	components := strings.Split(removeMarkers(rawMessage), "|")
+	if len(components) < 2 {
+		return nil, fmt.Errorf("failed to properly split the status string")
 	}
-	return byte((8 - index / 8) * 10 + index % 8 + 1)
-	// (8 − TRUNC(+ $A2 ÷ 8) ) × 10 + MOD(A2;8) + 1
+
+	grblStatus := GrblStatus{}
+	for i, component := range components {
+		if i == 0 {
+			grblStatus.state = component
+		} else {
+			kv := strings.Split(component, ":")
+			if kv[0] == "MPos" {
+				values := strings.Split(kv[1], ",")
+				grblStatus.position.X, _ = strconv2.ParseFloat(values[0], 32)
+				grblStatus.position.Y, _ = strconv2.ParseFloat(values[1], 32)
+				grblStatus.position.Z, _ = strconv2.ParseFloat(values[2], 32)
+			} else {
+				// log.Printf("not handling %s yet", kv[0])
+			}
+		}
+	}
+
+	return &grblStatus, nil
+}
+
+func removeMarkers(s string) string {
+	r := []rune(s)
+	return string(r[1 : len(r)-1])
 }
