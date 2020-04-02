@@ -4,18 +4,12 @@ import (
 	"fmt"
 	"github.com/spark404/go-coremidi"
 	"log"
+	"os"
+	"os/signal"
 	strconv2 "strconv"
 	"strings"
 	"time"
 )
-
-type Playback struct {
-	Group   string
-	Page    int
-	Index   int
-	TitanId int
-	Active  bool
-}
 
 type GrblStatus struct {
 	state    string
@@ -42,7 +36,7 @@ func (g *GrblCommandStack) Push(command string) (int, error) {
 	g.commands = append(g.commands, command)
 	g.rxbufferRemaining -= len(command)
 
-	log.Printf("Push command '%s' on stack, %d remaining", command, g.rxbufferRemaining)
+	log.Printf("Push command '%s' on stack, %d remaining", strings.TrimRight(command, "\r\n"), g.rxbufferRemaining)
 	return len(command), nil
 }
 
@@ -56,7 +50,7 @@ func (g *GrblCommandStack) Pop() error {
 
 	g.rxbufferRemaining += len(poppedCommand)
 
-	log.Printf("Pop command '%s' from stack, %d remaining", poppedCommand, g.rxbufferRemaining)
+	log.Printf("Pop command '%s' from stack, %d remaining", strings.TrimRight(poppedCommand, "\r\n"), g.rxbufferRemaining)
 	return nil
 }
 
@@ -68,14 +62,20 @@ func main() {
 	serialData := make(chan string)
 	statusUpdate := make(chan GrblStatus, 2)
 	positionChange := make(chan GrblPositionChangeRequest, 2)
+	quit := make(chan os.Signal, 1)
 
+	signal.Notify(quit, os.Interrupt)
+
+	log.Printf("Establishing serial connection to GRBL")
 	serialConnection, err := NewSerialConnection(serialData)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	_, err = NewLaunchpad(statusUpdate, positionChange)
+	log.Printf("Establishing midi connection to Launchpad")
+	launchpad, err := NewLaunchpad(statusUpdate, positionChange)
 	if err != nil {
+		_ = serialConnection.Close()
 		log.Fatal(err)
 	}
 
@@ -85,10 +85,15 @@ func main() {
 
 	tick := time.Tick(1 * time.Second)
 
+mainloop:
 	for {
 		select {
+		case <-quit:
+			log.Printf("Received shutdown signal")
+			serialConnection.Close()
+			launchpad.Close()
+			break mainloop
 		case message := <-serialData:
-			log.Printf("IN: %s", message)
 			if message[0] == '<' {
 				status, err := ParseStatus(message)
 				if err != nil {
@@ -123,9 +128,6 @@ func main() {
 			if n != 1 {
 				log.Println("huh")
 			}
-		default:
-			// Pacing, do we need this?
-			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
@@ -140,9 +142,9 @@ func Filter(vs []coremidi.Device, f func(coremidi.Device) bool) []coremidi.Devic
 	return vsf
 }
 
-func FindEntityByName(entities []coremidi.Entity, needle string) []coremidi.Entity {
+func FindEntityByName(haystack []coremidi.Entity, needle string) []coremidi.Entity {
 	vsf := make([]coremidi.Entity, 0)
-	for _, element := range entities {
+	for _, element := range haystack {
 		if element.Name() == needle {
 			vsf = append(vsf, element)
 		}

@@ -2,22 +2,77 @@ package main
 
 import (
 	"bytes"
-	"encoding/hex"
 	"fmt"
 	"github.com/spark404/go-coremidi"
 	"log"
 	"math"
+	"time"
 )
 
 type Launchpad struct {
-	client      *coremidi.Client
-	outPort     coremidi.OutputPort
+	client *coremidi.Client
+
+	inPort  coremidi.InputPort
+	outPort coremidi.OutputPort
+
+	portConnection coremidi.PortConnection
+
 	destination coremidi.Destination
 
 	statusChannel         <-chan GrblStatus
 	positionChangeChannel chan<- GrblPositionChangeRequest
 
 	currentState string
+}
+
+type StandaloneLayout byte
+
+const (
+	Note       StandaloneLayout = 0
+	Drum       StandaloneLayout = 1
+	Fader      StandaloneLayout = 2
+	Programmer StandaloneLayout = 3
+)
+
+func (s StandaloneLayout) AsByte() byte {
+	return byte(s)
+}
+
+type SysExParameter byte
+
+const (
+	SetLEDs                SysExParameter = 0x0A
+	SetLEDsRGB             SysExParameter = 0x0B
+	SetLEDsByColumn        SysExParameter = 0x0C
+	SetLEDsByRow           SysExParameter = 0x0D
+	SetAllLEDs             SysExParameter = 0x0E
+	SetAllLEDsInGridRGB    SysExParameter = 0x0F
+	ScrollText             SysExParameter = 0x14
+	ModeSelection          SysExParameter = 0x21
+	ModeStatus             SysExParameter = 0x2D
+	FlashLED               SysExParameter = 0x23
+	PulseLED               SysExParameter = 0x28
+	FaderSetup             SysExParameter = 0x2B
+	StandaloneLayoutSelect SysExParameter = 0x2C
+	StandaloneLayoutStatus SysExParameter = 0x2F
+)
+
+func (s SysExParameter) AsByte() byte {
+	return byte(s)
+}
+
+type Button byte
+
+const (
+	Record     Button = 0x0A
+	ArrowUp    Button = 0x5B
+	ArrowDown  Button = 0x5C
+	ArrowLeft  Button = 0x5D
+	ArrowRight Button = 0x5E
+)
+
+func (b Button) asByte() byte {
+	return byte(b)
 }
 
 func NewLaunchpad(statusChannel <-chan GrblStatus, positionChange chan<- GrblPositionChangeRequest) (*Launchpad, error) {
@@ -37,12 +92,12 @@ func NewLaunchpad(statusChannel <-chan GrblStatus, positionChange chan<- GrblPos
 func (l *Launchpad) init() error {
 	client, err := coremidi.NewClient("midithing")
 	if err != nil {
-		return fmt.Errorf("failed to init coremidi client: %+w", err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
 	devices, err := coremidi.AllDevices()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
 	launchpads := Filter(devices, func(v coremidi.Device) bool {
@@ -50,31 +105,31 @@ func (l *Launchpad) init() error {
 	})
 
 	if len(launchpads) == 0 {
-		log.Fatal("Device \"Launchpad Pro\" not found")
+		return fmt.Errorf("device not found")
 	}
 
 	launchpad := launchpads[0] // Use the first one regardless
 	log.Printf("Found %v : %v\n", launchpad.Manufacturer(), launchpad.Name())
 
 	if launchpad.IsOffline() {
-		log.Fatalf("Device is not online\n")
+		return fmt.Errorf("device offline")
 	}
 
 	entities, err := launchpad.Entities()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
 	entities = FindEntityByName(entities, "Standalone Port")
 	if len(entities) == 0 {
-		log.Fatal("Failed to find port")
+		return fmt.Errorf("standalone port not found")
 	}
 
 	entity := entities[0]
 
 	destinations, err := entity.Destinations()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
 	l.destination = destinations[0]
@@ -83,82 +138,49 @@ func (l *Launchpad) init() error {
 
 	l.outPort, err = coremidi.NewOutputPort(client, "Midithing Out")
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
-	inPort, err := coremidi.NewInputPort(client, "Midithing In", l.onMessage)
+	l.inPort, err = coremidi.NewInputPort(client, "Midithing In", l.onMessage)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
 	sources, err := entity.Sources()
 	if err != nil {
-		log.Fatalf("Failed to query sources on entity %s: %v", entity.Name(), err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
 	if len(sources) <= 0 {
-		log.Fatalf("No sources availale on entity %s: %v", entity.Name(), err)
+		return fmt.Errorf("no sources availale on entity %s: %w", entity.Name(), err)
 	}
 
-	if _, err := inPort.Connect(sources[0]); err != nil {
-		log.Fatalf("Failed to connect input to source %s: %v", sources[0].Name(), err)
+	if l.portConnection, err = l.inPort.Connect(sources[0]); err != nil {
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
-	var modeChange bytes.Buffer
-	modeChange.WriteByte(0xF0)
-	modeChange.WriteByte(0x00)
-	modeChange.WriteByte(0x20)
-	modeChange.WriteByte(0x29)
-	modeChange.WriteByte(0x02)
-	modeChange.WriteByte(0x10)
-	modeChange.WriteByte(0x2C)
-	modeChange.WriteByte(0x03) //Programmer layout 0x03
-	modeChange.WriteByte(0xF7)
-
-	modeChangePacket := coremidi.NewPacket(modeChange.Bytes(), 1234)
-	err = modeChangePacket.Send(&l.outPort, &l.destination)
-
-	if err != nil {
-		log.Fatal(err)
+	if err := l.SetStandaloneLayout(Programmer); err != nil {
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
-	var setAll bytes.Buffer
-	setAll.WriteByte(0xF0)
-	setAll.WriteByte(0x00)
-	setAll.WriteByte(0x20)
-	setAll.WriteByte(0x29)
-	setAll.WriteByte(0x02)
-	setAll.WriteByte(0x10)
-	setAll.WriteByte(0x0E) // set all
-	setAll.WriteByte(0x00) // color
-	setAll.WriteByte(0xF7)
-
-	setAllPacket := coremidi.NewPacket(setAll.Bytes(), 1234)
+	buffer := createSysExMessage([]byte{
+		SetAllLEDs.AsByte(),
+		0x00,
+	})
+	setAllPacket := coremidi.NewPacket(buffer, now())
 	err = setAllPacket.Send(&l.outPort, &l.destination)
 
-	var setArrows bytes.Buffer
-	setArrows.WriteByte(0xF0)
-	setArrows.WriteByte(0x00)
-	setArrows.WriteByte(0x20)
-	setArrows.WriteByte(0x29)
-	setArrows.WriteByte(0x02)
-	setArrows.WriteByte(0x10)
-	setArrows.WriteByte(0x0A)
-	setArrows.WriteByte(0x5B)
-	setArrows.WriteByte(0x4B)
-	setArrows.WriteByte(0x5C)
-	setArrows.WriteByte(0x4B)
-	setArrows.WriteByte(0x5D)
-	setArrows.WriteByte(0x4B)
-	setArrows.WriteByte(0x5E)
-	setArrows.WriteByte(0x4B)
-	setArrows.WriteByte(0xF7)
-
-	setArrowsPacket := coremidi.NewPacket(setArrows.Bytes(), 1234)
+	buffer = createSysExMessage([]byte{
+		SetLEDs.AsByte(),
+		ArrowUp.asByte(), 0x4B,
+		ArrowDown.asByte(), 0x4B,
+		ArrowLeft.asByte(), 0x4B,
+		ArrowRight.asByte(), 0x4B,
+	})
+	setArrowsPacket := coremidi.NewPacket(buffer, now())
 	err = setArrowsPacket.Send(&l.outPort, &l.destination)
-
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("coremidi error: %w", err)
 	}
 
 	return nil
@@ -196,35 +218,24 @@ func (l *Launchpad) setState(status string) error {
 	default:
 		return fmt.Errorf("no state %s", status)
 	}
-	var setColor bytes.Buffer
-	setColor.WriteByte(0xF0)
-	setColor.WriteByte(0x00)
-	setColor.WriteByte(0x20)
-	setColor.WriteByte(0x29)
-	setColor.WriteByte(0x02)
-	setColor.WriteByte(0x10)
-	setColor.WriteByte(0x0A)
-	setColor.WriteByte(0x0A)
-	setColor.WriteByte(byte(color)) // color
-	setColor.WriteByte(0xF7)
 
-	packet := coremidi.NewPacket(setColor.Bytes(), 1234)
+	buffer := createSysExMessage([]byte{
+		SetLEDs.AsByte(),
+		Record.asByte(),
+		byte(color),
+	})
+
+	packet := coremidi.NewPacket(buffer, now())
 	_ = packet.Send(&l.outPort, &l.destination)
 
 	if color != pulseColor {
-		var setPulseColor bytes.Buffer
-		setPulseColor.WriteByte(0xF0)
-		setPulseColor.WriteByte(0x00)
-		setPulseColor.WriteByte(0x20)
-		setPulseColor.WriteByte(0x29)
-		setPulseColor.WriteByte(0x02)
-		setPulseColor.WriteByte(0x10)
-		setPulseColor.WriteByte(0x28)
-		setPulseColor.WriteByte(0x0A)
-		setPulseColor.WriteByte(byte(pulseColor)) // color
-		setPulseColor.WriteByte(0xF7)
+		buffer := createSysExMessage([]byte{
+			PulseLED.AsByte(),
+			Record.asByte(),
+			byte(color),
+		})
 
-		packet = coremidi.NewPacket(setPulseColor.Bytes(), 1235)
+		packet = coremidi.NewPacket(buffer, 1235)
 		_ = packet.Send(&l.outPort, &l.destination)
 	}
 
@@ -254,13 +265,7 @@ func (l *Launchpad) setPosition(x float64, y float64) error {
 
 func (l *Launchpad) setRowColor(matrix [8][8]byte) error {
 	var setColor bytes.Buffer
-	setColor.WriteByte(0xF0)
-	setColor.WriteByte(0x00)
-	setColor.WriteByte(0x20)
-	setColor.WriteByte(0x29)
-	setColor.WriteByte(0x02)
-	setColor.WriteByte(0x10)
-	setColor.WriteByte(0x0A)
+	setColor.WriteByte(SetLEDs.AsByte())
 
 	for row := range matrix {
 		firstIndex := (row+1)*10 + 1
@@ -270,36 +275,40 @@ func (l *Launchpad) setRowColor(matrix [8][8]byte) error {
 		}
 	}
 
-	setColor.WriteByte(0xF7)
-
-	setAllPacket := coremidi.NewPacket(setColor.Bytes(), 1234)
+	setAllPacket := coremidi.NewPacket(createSysExMessage(setColor.Bytes()), now())
 	return setAllPacket.Send(&l.outPort, &l.destination)
 }
 
 func (l *Launchpad) onMessage(source coremidi.Source, packet coremidi.Packet) {
 	if packet.Data[0] == 0xb0 { // CC
-		if packet.Data[2] == 127 {
+
+		if packet.Data[2] != 127 {
+			// Ignore everything but "button down"
 			return
 		}
 
-		// Arrow buttons, relative movement
-		positionChange := GrblPositionChangeRequest{
-			Relative: true,
+		switch Button(packet.Data[1]) {
+		case ArrowUp:
+			l.positionChangeChannel <- GrblPositionChangeRequest{
+				Y:        1,
+				Relative: true,
+			}
+		case ArrowDown:
+			l.positionChangeChannel <- GrblPositionChangeRequest{
+				Y:        -1,
+				Relative: true,
+			}
+		case ArrowLeft:
+			l.positionChangeChannel <- GrblPositionChangeRequest{
+				X:        -1,
+				Relative: true,
+			}
+		case ArrowRight:
+			l.positionChangeChannel <- GrblPositionChangeRequest{
+				X:        1,
+				Relative: true,
+			}
 		}
-
-		switch packet.Data[1] {
-		case 0x5b: // Up
-			positionChange.Y = 1
-		case 0x5c: // Down
-			positionChange.Y = -1
-		case 0x5d: // Left
-			positionChange.X = -1
-		case 0x5e: // Right
-			positionChange.X = 1
-		}
-
-		log.Printf("Sending position change: %v", positionChange)
-		l.positionChangeChannel <- positionChange
 	} else if packet.Data[0] == 0x90 && packet.Data[2] > 0 { // Note On
 		row := packet.Data[1] / 10
 		column := packet.Data[1] % 10
@@ -318,9 +327,42 @@ func (l *Launchpad) onMessage(source coremidi.Source, packet coremidi.Packet) {
 
 		log.Printf("Sending position change: %v", positionChange)
 		l.positionChangeChannel <- positionChange
-	} else {
-		log.Printf("Got something from source %s", source.Name())
-		log.Print(hex.Dump(packet.Data))
+	}
+}
+
+func (l *Launchpad) Close() {
+	log.Printf("Resetting to Note layout")
+	if err := l.SetStandaloneLayout(Note); err != nil {
+		log.Printf("Error: %v", err)
 	}
 
+	log.Printf("Disconnecting from MIDI sources")
+	l.portConnection.Disconnect()
+}
+
+func (l *Launchpad) SetStandaloneLayout(standaloneLayout StandaloneLayout) error {
+	buffer := createSysExMessage([]byte{
+		StandaloneLayoutSelect.AsByte(),
+		standaloneLayout.AsByte(),
+	})
+
+	modeChangePacket := coremidi.NewPacket(buffer, now())
+	if err := modeChangePacket.Send(&l.outPort, &l.destination); err != nil {
+		return fmt.Errorf("error while sending packet: %w", err)
+	}
+
+	return nil
+}
+
+func createSysExMessage(data []byte) []byte {
+	var sysEx bytes.Buffer
+	sysEx.Write([]byte{0xF0, 0x00, 0x20, 0x29, 0x02, 0x10})
+	sysEx.Write(data)
+	sysEx.Write([]byte{0xF7})
+
+	return sysEx.Bytes()
+}
+
+func now() uint64 {
+	return uint64(time.Now().Unix())
 }

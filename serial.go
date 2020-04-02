@@ -6,6 +6,7 @@ import (
 	"github.com/glycerine/rbuf"
 	"go.bug.st/serial"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -73,6 +74,7 @@ func (s *SerialConnection) reader() {
 		}
 
 		s.ringBuffer.Advance(i + 2)
+		log.Printf("serial IN: '%s' (%d bytes)", peek[:i], len(peek[:i]))
 		s.readChannel <- string(peek[:i])
 	}
 }
@@ -91,6 +93,16 @@ func (s *SerialConnection) Write(data string) (int, error) {
 		bytesWritten = bytesWritten + n
 	}
 
-	log.Printf("OUT: '%s' (%d bytes)", data, bytesWritten)
+	log.Printf("serial OUT: '%s' (%d bytes)", strings.TrimRight(data, "\r\n"), bytesWritten)
 	return bytesWritten, nil
+}
+
+func (s *SerialConnection) Close() error {
+	log.Println("Closing serial connection")
+
+	if err := s.serialPort.Close(); err != nil {
+		log.Printf("error during close: %v", err)
+	}
+
+	return nil
 }
