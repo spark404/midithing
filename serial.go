@@ -97,12 +97,10 @@ func (s *SerialConnection) Write(data string) (int, error) {
 	return bytesWritten, nil
 }
 
-func (s *SerialConnection) Close() error {
+func (s *SerialConnection) Close() {
 	log.Println("Closing serial connection")
 
 	if err := s.serialPort.Close(); err != nil {
 		log.Printf("error during close: %v", err)
 	}
-
-	return nil
 }

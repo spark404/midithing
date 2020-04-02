@@ -215,6 +215,9 @@ func (l *Launchpad) setState(status string) error {
 	case "Run":
 		color = 75
 		pulseColor = 76
+	case "Alarm":
+		color = 5
+		pulseColor = 0
 	default:
 		return fmt.Errorf("no state %s", status)
 	}
